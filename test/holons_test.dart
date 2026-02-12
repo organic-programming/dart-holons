@@ -8,6 +8,9 @@ void main() {
       expect(scheme('tcp://:9090'), equals('tcp'));
       expect(scheme('unix:///tmp/x.sock'), equals('unix'));
       expect(scheme('stdio://'), equals('stdio'));
+      expect(scheme('mem://'), equals('mem'));
+      expect(scheme('ws://127.0.0.1:8080/grpc'), equals('ws'));
+      expect(scheme('wss://example.com:443/grpc'), equals('wss'));
     });
 
     test('defaultUri is tcp://:9090', () {
@@ -15,9 +18,39 @@ void main() {
     });
 
     test('listen tcp', () async {
-      final srv = await listen('tcp://127.0.0.1:0');
-      expect(srv.port, greaterThan(0));
-      await srv.close();
+      final listener = await listen('tcp://127.0.0.1:0');
+      expect(listener, isA<TcpTransportListener>());
+      final tcp = listener as TcpTransportListener;
+      expect(tcp.socket.port, greaterThan(0));
+      await tcp.socket.close();
+    });
+
+    test('parseUri wss defaults', () {
+      final parsed = parseUri('wss://example.com:8443');
+      expect(parsed.scheme, equals('wss'));
+      expect(parsed.host, equals('example.com'));
+      expect(parsed.port, equals(8443));
+      expect(parsed.path, equals('/grpc'));
+      expect(parsed.secure, isTrue);
+    });
+
+    test('stdio and mem variants', () async {
+      final stdio = await listen('stdio://');
+      final mem = await listen('mem://');
+      expect(stdio, isA<StdioTransportListener>());
+      expect(mem, isA<MemTransportListener>());
+      expect((stdio as StdioTransportListener).address, equals('stdio://'));
+      expect((mem as MemTransportListener).address, equals('mem://'));
+    });
+
+    test('ws variant', () async {
+      final listener = await listen('ws://127.0.0.1:8080/holon');
+      expect(listener, isA<WsTransportListener>());
+      final ws = listener as WsTransportListener;
+      expect(ws.host, equals('127.0.0.1'));
+      expect(ws.port, equals(8080));
+      expect(ws.path, equals('/holon'));
+      expect(ws.secure, isFalse);
     });
 
     test('unsupported uri throws', () {

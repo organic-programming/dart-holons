@@ -12,8 +12,8 @@ status: draft
 ---
 # dart-holons
 
-**Dart SDK for Organic Programming** — transport, serve, and identity
-utilities for building holons in Dart.
+**Dart SDK for Organic Programming** — transport, serve, identity,
+and Holon-RPC client utilities for building holons in Dart.
 
 ## Test
 
@@ -28,6 +28,7 @@ dart test
 | `transport.dart` | `parseUri(uri)`, `listen(uri)`, `listenRuntime(uri)`, `scheme(uri)` |
 | `serve.dart` | `parseFlags(args)` |
 | `identity.dart` | `parseHolon(path)` |
+| `holonrpc.dart` | `HolonRPCClient.connect(url)`, `invoke(method, params)`, `register(method, handler)`, `close()` |
 
 ## Transport support
 
@@ -47,6 +48,7 @@ Implemented parity:
 - URI parsing and listener dispatch semantics
 - Native runtime listeners for `tcp`, `unix`, `stdio`, and `mem`
 - In-process memory transport with explicit `dial()`/`accept()` pairing
+- Holon-RPC client protocol support over `ws://` / `wss://` (JSON-RPC 2.0, heartbeat, reconnect)
 - Standard serve flag parsing
 - HOLON identity parsing including list/meta fields (`parents`, `aliases`, `generated_by`, `proto_status`)
 
@@ -56,5 +58,7 @@ Not yet achievable with the current Dart stack (justified gaps):
   - Go uses a `net.Listener` abstraction over upgraded WebSocket streams.
   - `grpc-dart` does not provide an official WebSocket server transport for HTTP/2 gRPC framing.
   - `listenRuntime(uri)` therefore throws `UnsupportedError` for `ws/wss`.
-- Transport-agnostic gRPC client helpers (`Dial`, `DialStdio`, `DialMem`, `DialWebSocket`):
-  - A faithful Dart equivalent needs a dedicated gRPC channel helper layer that is not yet part of this SDK.
+- Full gRPC transport parity (`Dial("tcp://...")`, `Dial("stdio://...")`, `Listen("stdio://...")`, and `Serve.Run()` wiring):
+  - `grpc-dart` supports TCP channels/servers but does not expose an official stdio transport equivalent to Go `net.Listener`.
+  - `grpc-dart` also lacks built-in server reflection and process-pipe orchestration primitives used by the Go reference `serve` flow.
+  - This SDK currently provides transport runtime primitives plus Holon-RPC client support; gRPC convenience wiring remains pending.

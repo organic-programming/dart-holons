@@ -4,3 +4,4 @@ library holons;
 export 'src/transport.dart';
 export 'src/serve.dart';
 export 'src/identity.dart';
+export 'src/holonrpc.dart';

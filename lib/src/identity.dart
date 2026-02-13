@@ -12,6 +12,11 @@ class HolonIdentity {
   final String status;
   final String born;
   final String lang;
+  final List<String> parents;
+  final String reproduction;
+  final String generatedBy;
+  final String protoStatus;
+  final List<String> aliases;
 
   HolonIdentity({
     this.uuid = '',
@@ -23,6 +28,11 @@ class HolonIdentity {
     this.status = '',
     this.born = '',
     this.lang = '',
+    this.parents = const <String>[],
+    this.reproduction = '',
+    this.generatedBy = '',
+    this.protoStatus = '',
+    this.aliases = const <String>[],
   });
 }
 
@@ -40,7 +50,8 @@ HolonIdentity parseHolon(String path) {
   }
 
   final frontmatter = text.substring(3, endIdx).trim();
-  final data = loadYaml(frontmatter) as YamlMap;
+  final raw = loadYaml(frontmatter);
+  final data = raw is YamlMap ? raw : YamlMap();
 
   return HolonIdentity(
     uuid: (data['uuid'] ?? '').toString(),
@@ -52,5 +63,20 @@ HolonIdentity parseHolon(String path) {
     status: (data['status'] ?? '').toString(),
     born: (data['born'] ?? '').toString(),
     lang: (data['lang'] ?? '').toString(),
+    parents: _toStringList(data['parents']),
+    reproduction: (data['reproduction'] ?? '').toString(),
+    generatedBy: (data['generated_by'] ?? '').toString(),
+    protoStatus: (data['proto_status'] ?? '').toString(),
+    aliases: _toStringList(data['aliases']),
   );
+}
+
+List<String> _toStringList(Object? value) {
+  if (value is YamlList) {
+    return value.map((item) => item.toString()).toList(growable: false);
+  }
+  if (value is List) {
+    return value.map((item) => item.toString()).toList(growable: false);
+  }
+  return const <String>[];
 }

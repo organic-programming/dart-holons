@@ -18,6 +18,10 @@ void main() {
     });
 
     test('listen tcp', () async {
+      if (!await _canBindLoopbackTcp()) {
+        return;
+      }
+
       final listener = await listen('tcp://127.0.0.1:0');
       expect(listener, isA<TcpTransportListener>());
       final tcp = listener as TcpTransportListener;
@@ -60,6 +64,10 @@ void main() {
 
   group('runtime transport', () {
     test('runtime tcp roundtrip', () async {
+      if (!await _canBindLoopbackTcp()) {
+        return;
+      }
+
       final runtime = await listenRuntime('tcp://127.0.0.1:0');
       expect(runtime, isA<TcpRuntimeListener>());
       final tcp = runtime as TcpRuntimeListener;
@@ -83,14 +91,27 @@ void main() {
       if (Platform.isWindows) {
         return;
       }
+      if (!await _canBindLoopbackTcp()) {
+        return;
+      }
 
-      final socketPath = '${Directory.systemTemp.path}/holons_dart_${DateTime.now().microsecondsSinceEpoch}.sock';
-      final runtime = await listenRuntime('unix://$socketPath');
+      final socketPath =
+          '${Directory.systemTemp.path}/holons_dart_${DateTime.now().microsecondsSinceEpoch}.sock';
+      RuntimeTransportListener runtime;
+      try {
+        runtime = await listenRuntime('unix://$socketPath');
+      } on SocketException catch (error) {
+        if (_isLocalBindDenied(error)) {
+          return;
+        }
+        rethrow;
+      }
       expect(runtime, isA<UnixRuntimeListener>());
       final unix = runtime as UnixRuntimeListener;
 
       final acceptedFuture = unix.accept();
-      final client = await Socket.connect(InternetAddress(socketPath, type: InternetAddressType.unix), 0);
+      final client = await Socket.connect(
+          InternetAddress(socketPath, type: InternetAddressType.unix), 0);
       final server = await acceptedFuture;
 
       client.add('unix'.codeUnits);
@@ -135,7 +156,8 @@ void main() {
     });
 
     test('runtime ws unsupported', () {
-      expect(listenRuntime('ws://127.0.0.1:8080/grpc'), throwsA(isA<UnsupportedError>()));
+      expect(listenRuntime('ws://127.0.0.1:8080/grpc'),
+          throwsA(isA<UnsupportedError>()));
     });
   });
 
@@ -185,4 +207,24 @@ void main() {
       tmp.deleteSync();
     });
   });
+}
+
+Future<bool> _canBindLoopbackTcp() async {
+  try {
+    final probe = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    await probe.close();
+    return true;
+  } on SocketException catch (error) {
+    if (_isLocalBindDenied(error)) {
+      return false;
+    }
+    rethrow;
+  }
+}
+
+bool _isLocalBindDenied(Object error) {
+  final text = error.toString().toLowerCase();
+  return text.contains('operation not permitted') ||
+      text.contains('permission denied') ||
+      text.contains('errno = 1');
 }

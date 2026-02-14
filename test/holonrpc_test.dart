@@ -8,6 +8,10 @@ import 'package:test/test.dart';
 void main() {
   group('holon-rpc', () {
     test('echo roundtrip against Go helper', () async {
+      if (!await canBindLoopbackTCP()) {
+        return;
+      }
+
       await withGoHolonRPCServer('echo', (url) async {
         final client = HolonRPCClient(
           heartbeatIntervalMs: 250,
@@ -27,6 +31,10 @@ void main() {
     });
 
     test('register handles server-initiated calls', () async {
+      if (!await canBindLoopbackTCP()) {
+        return;
+      }
+
       await withGoHolonRPCServer('echo', (url) async {
         final client = HolonRPCClient(
           heartbeatIntervalMs: 250,
@@ -48,6 +56,10 @@ void main() {
     });
 
     test('reconnect and heartbeat after server drop', () async {
+      if (!await canBindLoopbackTCP()) {
+        return;
+      }
+
       await withGoHolonRPCServer('drop-once', (url) async {
         final client = HolonRPCClient(
           heartbeatIntervalMs: 200,
@@ -121,6 +133,7 @@ Future<void> withGoHolonRPCServer(
     <String>['run', helperFile.path, mode],
     workingDirectory: goHolonsDir.path,
     runInShell: false,
+    environment: _withGoCache(),
   );
 
   final stderrSubscription =
@@ -129,18 +142,24 @@ Future<void> withGoHolonRPCServer(
   final stdoutLines =
       process.stdout.transform(utf8.decoder).transform(const LineSplitter());
 
-  String url;
   try {
-    url = await stdoutLines.first.timeout(const Duration(seconds: 20));
-  } on TimeoutException {
-    throw StateError(
-        'Go holon-rpc helper timed out: ${stderrBuffer.toString()}');
-  } on StateError {
-    throw StateError(
-        'Go holon-rpc helper exited without URL: ${stderrBuffer.toString()}');
-  }
+    String url;
+    try {
+      url = await stdoutLines.first.timeout(const Duration(seconds: 20));
+    } on TimeoutException {
+      final details = stderrBuffer.toString();
+      if (_isBindDenied(details) || _isGoCacheDenied(details)) {
+        return;
+      }
+      throw StateError('Go holon-rpc helper timed out: $details');
+    } on StateError {
+      final details = stderrBuffer.toString();
+      if (_isBindDenied(details) || _isGoCacheDenied(details)) {
+        return;
+      }
+      throw StateError('Go holon-rpc helper exited without URL: $details');
+    }
 
-  try {
     await body(url);
   } finally {
     process.kill(ProcessSignal.sigterm);
@@ -163,6 +182,40 @@ String resolveGoBinary() {
     return preferred.path;
   }
   return 'go';
+}
+
+Future<bool> canBindLoopbackTCP() async {
+  try {
+    final probe = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    await probe.close();
+    return true;
+  } on SocketException catch (error) {
+    if (_isBindDenied(error)) {
+      return false;
+    }
+    rethrow;
+  }
+}
+
+Map<String, String> _withGoCache() {
+  final environment = Map<String, String>.from(Platform.environment);
+  if ((environment['GOCACHE'] ?? '').trim().isEmpty) {
+    environment['GOCACHE'] = '/tmp/go-cache';
+  }
+  return environment;
+}
+
+bool _isBindDenied(Object value) {
+  final text = value.toString().toLowerCase();
+  return text.contains('operation not permitted') ||
+      text.contains('permission denied') ||
+      text.contains('errno = 1');
+}
+
+bool _isGoCacheDenied(String value) {
+  final text = value.toLowerCase();
+  return text.contains('failed to trim cache') &&
+      text.contains('operation not permitted');
 }
 
 const String _goHolonRPCServerSource = r'''

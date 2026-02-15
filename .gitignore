@@ -1,4 +1,6 @@
 .dart_tool/
 pubspec.lock
 
-bin/
+bin/*
+!bin/holon-rpc-server
+!bin/holonrpc_server.dart

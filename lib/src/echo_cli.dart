@@ -15,7 +15,8 @@ const String preferredGoBinary = '/Users/bpds/go/go1.25.1/bin/go';
 
 const String echoClientUsage = 'usage: echo-client '
     '[--sdk name] [--server-sdk name] [--message hello] '
-    '[--timeout-ms 5000] [--go go] [tcp://host:port|unix://path|stdio://]';
+    '[--timeout-ms 5000] [--go go] '
+    '[tcp://host:port|unix://path|stdio://|mem://name|ws://host:port/grpc|wss://host:port/grpc]';
 
 const String echoServerUsage =
     'usage: echo-server [--go go] [echo-server flags...]';
@@ -157,7 +158,7 @@ ProcessInvocation buildEchoClientInvocation(
   Map<String, String>? baseEnvironment,
 }) {
   final rootPath = sdkRootPath ?? _defaultSDKRootPath();
-  final helperPath = '$rootPath/../js-web-holons/cmd/echo-client-go/main.go';
+  final helperPath = '$rootPath/cmd/echo-client-go/main.go';
   final goHolonsPath = '$rootPath/../go-holons';
   final environment = _buildEnvironment(baseEnvironment);
 

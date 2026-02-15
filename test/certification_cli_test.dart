@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:holons/src/echo_cli.dart';
+import 'package:holons/src/holonrpc_server_cli.dart';
 import 'package:test/test.dart';
 
 void main() {
@@ -14,15 +15,20 @@ void main() {
 
       expect(executables['echo_server'], equals('./bin/echo-server'));
       expect(executables['echo_client'], equals('./bin/echo-client'));
+      expect(executables['holon_rpc_server'], equals('./bin/holon-rpc-server'));
       expect(capabilities['grpc_listen_tcp'], isTrue);
       expect(capabilities['grpc_listen_stdio'], isTrue);
       expect(capabilities['grpc_dial_tcp'], isTrue);
       expect(capabilities['grpc_dial_stdio'], isTrue);
+      expect(capabilities['grpc_dial_ws'], isTrue);
+      expect(capabilities['holon_rpc_server'], isTrue);
     });
 
     test('echo scripts exist', () {
       expect(File('bin/echo-client').existsSync(), isTrue);
       expect(File('bin/echo-server').existsSync(), isTrue);
+      expect(File('bin/holon-rpc-server').existsSync(), isTrue);
+      expect(File('bin/holonrpc_server.dart').existsSync(), isTrue);
     });
 
     test('echo scripts are executable on unix', () {
@@ -32,9 +38,11 @@ void main() {
 
       final clientMode = FileStat.statSync('bin/echo-client').mode;
       final serverMode = FileStat.statSync('bin/echo-server').mode;
+      final holonRPCServerMode = FileStat.statSync('bin/holon-rpc-server').mode;
 
       expect(clientMode & 0x49, greaterThan(0)); // 0o111
       expect(serverMode & 0x49, greaterThan(0)); // 0o111
+      expect(holonRPCServerMode & 0x49, greaterThan(0)); // 0o111
     });
 
     test('parseEchoClientArgs defaults and uri normalization', () {
@@ -108,8 +116,7 @@ void main() {
       expect(invocation.args[0], equals('run'));
       expect(
         invocation.args[1],
-        equals(
-            '/repo/sdk/dart-holons/../js-web-holons/cmd/echo-client-go/main.go'),
+        equals('/repo/sdk/dart-holons/cmd/echo-client-go/main.go'),
       );
       expect(invocation.args.last, equals('stdio://'));
       expect(invocation.workingDirectory,
@@ -188,6 +195,94 @@ void main() {
       );
 
       final invocation = buildEchoServerInvocation(
+        options,
+        sdkRootPath: '/repo/sdk/dart-holons',
+      );
+
+      expect(invocation.command, equals('go-custom'));
+      expect(
+        invocation.args.where((arg) => arg == '--sdk').length,
+        equals(1),
+      );
+      expect(
+        invocation.args.where((arg) => arg == '--version').length,
+        equals(1),
+      );
+      expect(invocation.args, contains('manual'));
+      expect(invocation.args, contains('9.9.9'));
+    });
+
+    test('parseHolonRPCServerArgs strips --go and keeps passthrough flags', () {
+      final options = parseHolonRPCServerArgs(
+        const <String>[
+          'ws://127.0.0.1:0/rpc',
+          '--once',
+          '--go',
+          'go-custom',
+          '--sdk',
+          'explicit',
+        ],
+      );
+
+      expect(options.goBinary, equals('go-custom'));
+      expect(
+        options.passthroughArgs,
+        equals(
+          const <String>[
+            'ws://127.0.0.1:0/rpc',
+            '--once',
+            '--sdk',
+            'explicit',
+          ],
+        ),
+      );
+    });
+
+    test(
+        'buildHolonRPCServerInvocation appends sdk/version defaults when missing',
+        () {
+      final options = parseHolonRPCServerArgs(
+        const <String>[
+          '--once',
+        ],
+        environment: const <String, String>{'GO_BIN': 'go-custom'},
+      );
+
+      final invocation = buildHolonRPCServerInvocation(
+        options,
+        sdkRootPath: '/repo/sdk/dart-holons',
+        baseEnvironment: const <String, String>{
+          'PATH': '/bin',
+          'GOCACHE': '/custom/cache',
+        },
+      );
+
+      expect(invocation.command, equals('go-custom'));
+      expect(invocation.args[0], equals('run'));
+      expect(
+        invocation.args[1],
+        equals('/repo/sdk/dart-holons/cmd/holon-rpc-server-go/main.go'),
+      );
+      expect(invocation.args, contains('--sdk'));
+      expect(invocation.args, contains('dart-holons'));
+      expect(invocation.args, contains('--version'));
+      expect(invocation.args, contains('0.1.0'));
+      expect(invocation.environment['GOCACHE'], equals('/custom/cache'));
+    });
+
+    test('buildHolonRPCServerInvocation respects explicit sdk/version', () {
+      final options = parseHolonRPCServerArgs(
+        const <String>[
+          '--sdk',
+          'manual',
+          '--version',
+          '9.9.9',
+          '--go',
+          'go-custom',
+        ],
+      );
+
+      final invocation = buildHolonRPCServerInvocation(
         options,
         sdkRootPath: '/repo/sdk/dart-holons',
       );

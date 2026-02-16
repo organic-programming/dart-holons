@@ -26,9 +26,9 @@
   },
   "lang": "dart",
   "last_certified": {
-    "commit": "ac1c8df",
+    "commit": "f03b890e4e4be5adec17e702bd309a261a502fcf",
     "date": "2026-02-16",
-    "level": 0
+    "level": 5
   },
   "role": "hub",
   "sdk": "dart-holons",

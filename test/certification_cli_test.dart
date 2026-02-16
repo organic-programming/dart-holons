@@ -29,6 +29,7 @@ void main() {
       expect(File('bin/echo-server').existsSync(), isTrue);
       expect(File('bin/holon-rpc-server').existsSync(), isTrue);
       expect(File('bin/holonrpc_server.dart').existsSync(), isTrue);
+      expect(File('cmd/echo-server-go/main.go').existsSync(), isTrue);
     });
 
     test('echo scripts are executable on unix', () {
@@ -43,6 +44,13 @@ void main() {
       expect(clientMode & 0x49, greaterThan(0)); // 0o111
       expect(serverMode & 0x49, greaterThan(0)); // 0o111
       expect(holonRPCServerMode & 0x49, greaterThan(0)); // 0o111
+    });
+
+    test('echo-server wrapper uses sdk helper and signal forwarding', () {
+      final content = File('bin/echo-server').readAsStringSync();
+      expect(content, contains('cmd/echo-server-go/main.go'));
+      expect(content, contains('forward_signal'));
+      expect(content, contains('dart-holons'));
     });
 
     test('parseEchoClientArgs defaults and uri normalization', () {
@@ -172,7 +180,10 @@ void main() {
 
       expect(invocation.command, equals('go-custom'));
       expect(invocation.args[0], equals('run'));
-      expect(invocation.args[1], equals('./cmd/echo-server'));
+      expect(
+        invocation.args[1],
+        equals('/repo/sdk/dart-holons/cmd/echo-server-go/main.go'),
+      );
       expect(invocation.args, contains('--sdk'));
       expect(invocation.args, contains('dart-holons'));
       expect(invocation.args, contains('--version'));

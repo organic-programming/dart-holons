@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -190,10 +191,11 @@ ProcessInvocation buildEchoServerInvocation(
   Map<String, String>? baseEnvironment,
 }) {
   final rootPath = sdkRootPath ?? _defaultSDKRootPath();
+  final helperPath = '$rootPath/cmd/echo-server-go/main.go';
   final goHolonsPath = '$rootPath/../go-holons';
   final commandArgs = <String>[
     'run',
-    './cmd/echo-server',
+    helperPath,
     ...options.passthroughArgs,
   ];
 
@@ -275,7 +277,35 @@ Future<int> runEchoServer(
     mode: ProcessStartMode.inheritStdio,
   );
 
-  return process.exitCode;
+  var forwardedSignal = false;
+  StreamSubscription<ProcessSignal>? sigtermSubscription;
+  StreamSubscription<ProcessSignal>? sigintSubscription;
+
+  void forwardSignal(ProcessSignal signal) {
+    forwardedSignal = true;
+    if (!process.kill(signal)) {
+      process.kill(ProcessSignal.sigterm);
+    }
+  }
+
+  if (!Platform.isWindows) {
+    sigtermSubscription = ProcessSignal.sigterm
+        .watch()
+        .listen((_) => forwardSignal(ProcessSignal.sigterm));
+    sigintSubscription = ProcessSignal.sigint
+        .watch()
+        .listen((_) => forwardSignal(ProcessSignal.sigint));
+  }
+
+  final code = await process.exitCode;
+
+  await sigtermSubscription?.cancel();
+  await sigintSubscription?.cancel();
+
+  if (forwardedSignal && code >= 128) {
+    return 0;
+  }
+  return code;
 }
 
 String normalizeEchoURI(String uri) {

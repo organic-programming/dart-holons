@@ -1,10 +1,24 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
 typedef HolonRPCHandler = FutureOr<Map<String, dynamic>> Function(
     Map<String, dynamic> params);
+
+const String _jsonRPCVersion = '2.0';
+const int _codeParseError = -32700;
+const int _codeInvalidRequest = -32600;
+const int _codeMethodNotFound = -32601;
+const int _codeInvalidParams = -32602;
+const int _codeInternalError = -32603;
+const int _codeNotFound = 5;
+const int _codeUnavailable = 14;
+
+const String _routeModeDefault = '';
+const String _routeModeBroadcastResponse = 'broadcast-response';
+const String _routeModeFullBroadcast = 'full-broadcast';
 
 class HolonRPCResponseException implements Exception {
   HolonRPCResponseException({
@@ -315,7 +329,12 @@ class HolonRPCClient {
       return;
     }
 
-    completer.complete(<String, dynamic>{});
+    if (rawResult == null) {
+      completer.complete(<String, dynamic>{});
+      return;
+    }
+
+    completer.complete(<String, dynamic>{'value': rawResult});
   }
 
   void _startHeartbeat() {
@@ -431,4 +450,1120 @@ class HolonRPCClient {
       }
     }
   }
+}
+
+class HolonRPCDispatchRoute {
+  const HolonRPCDispatchRoute({
+    required this.holonName,
+    required this.method,
+  });
+
+  final String holonName;
+  final String method;
+}
+
+class HolonRPCRouter {
+  final Map<String, String> _peerToName = <String, String>{};
+  final Map<String, LinkedHashSet<String>> _nameToPeers =
+      <String, LinkedHashSet<String>>{};
+
+  void registerHolon({
+    required String peerID,
+    required String name,
+  }) {
+    final trimmedPeerID = peerID.trim();
+    final trimmedName = name.trim();
+    if (trimmedPeerID.isEmpty) {
+      throw ArgumentError('peerID is required');
+    }
+    if (trimmedName.isEmpty) {
+      throw ArgumentError('name is required');
+    }
+
+    final previousName = _peerToName[trimmedPeerID];
+    if (previousName != null && previousName != trimmedName) {
+      final previousSet = _nameToPeers[previousName];
+      previousSet?.remove(trimmedPeerID);
+      if (previousSet != null && previousSet.isEmpty) {
+        _nameToPeers.remove(previousName);
+      }
+    }
+
+    _peerToName[trimmedPeerID] = trimmedName;
+    final peers = _nameToPeers.putIfAbsent(
+      trimmedName,
+      () => LinkedHashSet<String>(),
+    );
+    peers.add(trimmedPeerID);
+  }
+
+  void deregisterHolon(String peerID) {
+    final trimmedPeerID = peerID.trim();
+    if (trimmedPeerID.isEmpty) {
+      return;
+    }
+
+    final name = _peerToName.remove(trimmedPeerID);
+    if (name == null) {
+      return;
+    }
+
+    final peers = _nameToPeers[name];
+    peers?.remove(trimmedPeerID);
+    if (peers != null && peers.isEmpty) {
+      _nameToPeers.remove(name);
+    }
+  }
+
+  bool hasHolon(String name) {
+    final trimmedName = name.trim();
+    if (trimmedName.isEmpty) {
+      return false;
+    }
+    final peers = _nameToPeers[trimmedName];
+    return peers != null && peers.isNotEmpty;
+  }
+
+  String? resolveHolon(String name, {String? excludePeerID}) {
+    final trimmedName = name.trim();
+    if (trimmedName.isEmpty) {
+      return null;
+    }
+
+    final peers = _nameToPeers[trimmedName];
+    if (peers == null || peers.isEmpty) {
+      return null;
+    }
+
+    for (final peerID in peers) {
+      if (peerID == excludePeerID) {
+        continue;
+      }
+      return peerID;
+    }
+    return null;
+  }
+
+  String? holonNameOf(String peerID) => _peerToName[peerID];
+
+  HolonRPCDispatchRoute? parseDispatchRoute(String method) {
+    final trimmedMethod = method.trim();
+    if (trimmedMethod.isEmpty) {
+      return null;
+    }
+
+    final separator = trimmedMethod.indexOf('.');
+    if (separator <= 0 || separator >= trimmedMethod.length - 1) {
+      return null;
+    }
+
+    final holonName = trimmedMethod.substring(0, separator).trim();
+    final routedMethod = trimmedMethod.substring(separator + 1).trim();
+    if (holonName.isEmpty || routedMethod.isEmpty) {
+      return null;
+    }
+
+    return HolonRPCDispatchRoute(
+      holonName: holonName,
+      method: routedMethod,
+    );
+  }
+}
+
+class HolonRPCServer {
+  HolonRPCServer(
+    this.bindURL, {
+    HolonRPCRouter? router,
+  }) : _router = router ?? HolonRPCRouter();
+
+  final String bindURL;
+  final HolonRPCRouter _router;
+
+  final Map<String, HolonRPCHandler> _handlers = <String, HolonRPCHandler>{};
+  final Map<String, _HolonRPCServerPeer> _peers =
+      <String, _HolonRPCServerPeer>{};
+  final Queue<String> _connectQueue = Queue<String>();
+  final Queue<Completer<String>> _waiters = Queue<Completer<String>>();
+
+  HttpServer? _server;
+  String? _address;
+  String _path = '/rpc';
+  bool _closed = false;
+  int _nextClientID = 0;
+  int _nextServerID = 0;
+
+  HolonRPCRouter get router => _router;
+
+  String get address => _address ?? bindURL;
+
+  void register(String method, HolonRPCHandler handler) {
+    final trimmedMethod = method.trim();
+    if (trimmedMethod.isEmpty) {
+      throw ArgumentError('method is required');
+    }
+    _handlers[trimmedMethod] = handler;
+  }
+
+  void unregister(String method) {
+    _handlers.remove(method.trim());
+  }
+
+  List<String> clientIDs() => _peers.keys.toList(growable: false);
+
+  String? holonNameForPeer(String peerID) => _router.holonNameOf(peerID);
+
+  Future<String> start() async {
+    if (_closed) {
+      throw StateError('holon-rpc server is closed');
+    }
+    if (_server != null) {
+      return address;
+    }
+
+    final parsed = Uri.parse(bindURL);
+    if (parsed.scheme != 'ws') {
+      throw ArgumentError(
+        'unsupported scheme "${parsed.scheme}" (expected ws://)',
+      );
+    }
+
+    final host = parsed.host.isEmpty
+        ? InternetAddress.loopbackIPv4.address
+        : parsed.host;
+    final hasExplicitPort = _hasExplicitPortInURL(bindURL);
+    final port = hasExplicitPort ? parsed.port : 80;
+    _path = parsed.path.isEmpty ? '/rpc' : parsed.path;
+
+    final server = await HttpServer.bind(host, port);
+    _server = server;
+    server.listen(
+      (request) {
+        unawaited(_handleUpgrade(request));
+      },
+      onDone: () {
+        _closed = true;
+      },
+    );
+
+    final boundHost = _formatHostForURL(server.address.address);
+    _address = 'ws://$boundHost:${server.port}$_path';
+    return _address!;
+  }
+
+  Future<void> close() async {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+
+    final server = _server;
+    _server = null;
+    await server?.close(force: true);
+
+    final peers = _peers.values.toList(growable: false);
+    _peers.clear();
+
+    final closeError = HolonRPCResponseException(
+      code: _codeUnavailable,
+      message: 'holon-rpc connection closed',
+    );
+
+    for (final peer in peers) {
+      _router.deregisterHolon(peer.id);
+      _failPending(peer, closeError);
+      await peer.dispose(closeSocket: true);
+    }
+
+    _connectQueue.clear();
+    _failWaiters(StateError('holon-rpc server closed'));
+  }
+
+  Future<String> waitForClient({Duration? timeout}) async {
+    if (_connectQueue.isNotEmpty) {
+      return _connectQueue.removeFirst();
+    }
+    if (_closed) {
+      throw StateError('holon-rpc server is closed');
+    }
+
+    final waiter = Completer<String>();
+    _waiters.add(waiter);
+
+    Future<String> result = waiter.future;
+    if (timeout != null) {
+      result = result.timeout(timeout);
+    }
+
+    return result.whenComplete(() {
+      _waiters.remove(waiter);
+    });
+  }
+
+  Future<Map<String, dynamic>> invoke(
+    String clientID,
+    String method, {
+    Map<String, dynamic> params = const <String, dynamic>{},
+    Duration timeout = const Duration(seconds: 10),
+  }) async {
+    final trimmedMethod = method.trim();
+    if (trimmedMethod.isEmpty) {
+      throw ArgumentError('method is required');
+    }
+
+    final peer = _peers[clientID];
+    if (peer == null) {
+      throw HolonRPCResponseException(
+        code: _codeUnavailable,
+        message: 'unknown client "$clientID"',
+      );
+    }
+
+    final id = 's${++_nextServerID}';
+    final pending = Completer<Map<String, dynamic>>();
+    peer.pending[id] = pending;
+
+    try {
+      await _writePeer(
+        peer,
+        <String, dynamic>{
+          'jsonrpc': _jsonRPCVersion,
+          'id': id,
+          'method': trimmedMethod,
+          'params': params,
+        },
+      );
+    } catch (error) {
+      peer.pending.remove(id);
+      rethrow;
+    }
+
+    try {
+      return await pending.future.timeout(timeout);
+    } on TimeoutException {
+      throw HolonRPCResponseException(
+        code: 4,
+        message: 'deadline exceeded',
+      );
+    } finally {
+      peer.pending.remove(id);
+    }
+  }
+
+  Future<void> _handleUpgrade(HttpRequest request) async {
+    if (_closed) {
+      request.response.statusCode = HttpStatus.serviceUnavailable;
+      await request.response.close();
+      return;
+    }
+
+    if (request.uri.path != _path) {
+      request.response.statusCode = HttpStatus.notFound;
+      await request.response.close();
+      return;
+    }
+
+    WebSocket socket;
+    try {
+      socket = await WebSocketTransformer.upgrade(
+        request,
+        protocolSelector: (protocols) {
+          if (protocols.contains('holon-rpc')) {
+            return 'holon-rpc';
+          }
+          return null;
+        },
+      );
+    } catch (_) {
+      return;
+    }
+
+    if (socket.protocol != 'holon-rpc') {
+      await socket.close(
+        WebSocketStatus.protocolError,
+        'missing holon-rpc subprotocol',
+      );
+      return;
+    }
+
+    final clientID = 'c${++_nextClientID}';
+    final peer = _HolonRPCServerPeer(clientID, socket);
+    _peers[clientID] = peer;
+    _onClientConnected(clientID);
+
+    peer.subscription = socket.listen(
+      (data) {
+        _handleIncoming(peer, data);
+      },
+      onDone: () {
+        unawaited(_removePeer(peer.id));
+      },
+      onError: (Object _, StackTrace __) {
+        unawaited(_removePeer(peer.id));
+      },
+      cancelOnError: true,
+    );
+  }
+
+  void _onClientConnected(String clientID) {
+    if (_waiters.isNotEmpty) {
+      final waiter = _waiters.removeFirst();
+      if (!waiter.isCompleted) {
+        waiter.complete(clientID);
+      }
+      return;
+    }
+    _connectQueue.add(clientID);
+  }
+
+  void _failWaiters(Object error, [StackTrace? stackTrace]) {
+    while (_waiters.isNotEmpty) {
+      final waiter = _waiters.removeFirst();
+      if (!waiter.isCompleted) {
+        waiter.completeError(error, stackTrace);
+      }
+    }
+  }
+
+  Future<void> _removePeer(String peerID) async {
+    final peer = _peers.remove(peerID);
+    if (peer == null) {
+      return;
+    }
+
+    _router.deregisterHolon(peerID);
+    _failPending(
+      peer,
+      HolonRPCResponseException(
+        code: _codeUnavailable,
+        message: 'holon-rpc connection closed',
+      ),
+    );
+    await peer.dispose(closeSocket: false);
+  }
+
+  void _handleIncoming(_HolonRPCServerPeer peer, dynamic data) {
+    final String text;
+    if (data is String) {
+      text = data;
+    } else if (data is List<int>) {
+      text = utf8.decode(data);
+    } else {
+      return;
+    }
+
+    late final Object decoded;
+    try {
+      decoded = jsonDecode(text);
+    } catch (_) {
+      unawaited(_sendPeerError(
+        peer,
+        null,
+        _codeParseError,
+        'parse error',
+        null,
+        true,
+      ));
+      return;
+    }
+
+    if (decoded is! Map) {
+      unawaited(_sendPeerError(
+        peer,
+        null,
+        _codeInvalidRequest,
+        'invalid request',
+        null,
+        true,
+      ));
+      return;
+    }
+
+    final msg = decoded is Map<String, dynamic>
+        ? decoded
+        : decoded.cast<String, dynamic>();
+
+    if (msg['method'] != null) {
+      unawaited(_handlePeerRequest(peer, msg));
+      return;
+    }
+
+    if (msg.containsKey('result') || msg.containsKey('error')) {
+      _handlePeerResponse(peer, msg);
+      return;
+    }
+
+    if (_hasID(msg['id'])) {
+      unawaited(
+        _sendPeerError(peer, msg['id'], _codeInvalidRequest, 'invalid request'),
+      );
+    }
+  }
+
+  Future<void> _handlePeerRequest(
+    _HolonRPCServerPeer peer,
+    Map<String, dynamic> msg,
+  ) async {
+    final reqID = msg['id'];
+    final rawMethod = msg['method'];
+
+    if (msg['jsonrpc'] != _jsonRPCVersion ||
+        rawMethod is! String ||
+        rawMethod.trim().isEmpty) {
+      if (_hasID(reqID)) {
+        await _sendPeerError(
+            peer, reqID, _codeInvalidRequest, 'invalid request');
+      }
+      return;
+    }
+
+    var method = rawMethod.trim();
+    if (method == 'rpc.heartbeat') {
+      if (_hasID(reqID)) {
+        await _sendPeerResult(peer, reqID, <String, dynamic>{});
+      }
+      return;
+    }
+
+    Map<String, dynamic> params;
+    try {
+      params = _decodeParams(msg['params']);
+    } on HolonRPCResponseException catch (error) {
+      if (_hasID(reqID)) {
+        await _sendPeerError(
+            peer, reqID, error.code, error.message, error.data);
+      }
+      return;
+    }
+
+    if (method == 'rpc.register') {
+      await _handleRegister(peer, reqID, params);
+      return;
+    }
+
+    if (method == 'rpc.unregister') {
+      await _handleUnregister(peer, reqID);
+      return;
+    }
+
+    _ParsedRoute parsedRoute;
+    try {
+      parsedRoute = _parseRouteHints(method, params);
+    } on HolonRPCResponseException catch (error) {
+      if (_hasID(reqID)) {
+        await _sendPeerError(
+            peer, reqID, error.code, error.message, error.data);
+      }
+      return;
+    }
+
+    method = parsedRoute.method;
+    params = parsedRoute.params;
+
+    final routed = await _routePeerRequest(
+      peer,
+      reqID,
+      method,
+      params,
+      parsedRoute.hints,
+      parsedRoute.fanOut,
+    );
+    if (routed) {
+      return;
+    }
+
+    final handler = _handlers[method];
+    if (handler == null) {
+      if (_hasID(reqID)) {
+        await _sendPeerError(
+          peer,
+          reqID,
+          _codeMethodNotFound,
+          'method "$method" not found',
+        );
+      }
+      return;
+    }
+
+    try {
+      final result = await handler(params);
+      if (_hasID(reqID)) {
+        await _sendPeerResult(peer, reqID, result);
+      }
+    } on HolonRPCResponseException catch (error) {
+      if (_hasID(reqID)) {
+        await _sendPeerError(
+            peer, reqID, error.code, error.message, error.data);
+      }
+    } catch (error) {
+      if (_hasID(reqID)) {
+        await _sendPeerError(peer, reqID, _codeInternalError, 'internal error');
+      }
+    }
+  }
+
+  void _handlePeerResponse(
+    _HolonRPCServerPeer peer,
+    Map<String, dynamic> msg,
+  ) {
+    final rawID = msg['id'];
+    if (rawID is! String) {
+      return;
+    }
+
+    final pending = peer.pending.remove(rawID);
+    if (pending == null || pending.isCompleted) {
+      return;
+    }
+
+    final rawError = msg['error'];
+    if (rawError is Map<String, dynamic>) {
+      final rawCode = rawError['code'];
+      final code = rawCode is int
+          ? rawCode
+          : (rawCode is num ? rawCode.toInt() : _codeInternalError);
+      pending.completeError(
+        HolonRPCResponseException(
+          code: code,
+          message: rawError['message']?.toString() ?? 'internal error',
+          data: rawError['data'],
+        ),
+      );
+      return;
+    }
+    if (rawError is Map) {
+      final casted = rawError.cast<String, dynamic>();
+      final rawCode = casted['code'];
+      final code = rawCode is int
+          ? rawCode
+          : (rawCode is num ? rawCode.toInt() : _codeInternalError);
+      pending.completeError(
+        HolonRPCResponseException(
+          code: code,
+          message: casted['message']?.toString() ?? 'internal error',
+          data: casted['data'],
+        ),
+      );
+      return;
+    }
+
+    pending.complete(_normalizeResult(msg['result']));
+  }
+
+  Future<bool> _routePeerRequest(
+    _HolonRPCServerPeer caller,
+    dynamic reqID,
+    String method,
+    Map<String, dynamic> params,
+    _RouteHints hints,
+    bool fanOut,
+  ) async {
+    if (fanOut) {
+      List<Map<String, dynamic>> entries;
+      try {
+        entries = await _dispatchFanOut(caller, method, params);
+      } on HolonRPCResponseException catch (error) {
+        if (_hasID(reqID)) {
+          await _sendPeerError(
+            caller,
+            reqID,
+            error.code,
+            error.message,
+            error.data,
+          );
+        }
+        return true;
+      }
+
+      if (hints.mode == _routeModeFullBroadcast) {
+        for (final entry in entries) {
+          final sourcePeer = entry['peer']?.toString() ?? '';
+          final payload = <String, dynamic>{'peer': sourcePeer};
+          if (entry.containsKey('error')) {
+            payload['error'] = entry['error'];
+          } else {
+            payload['result'] = entry['result'];
+          }
+
+          final excluded = <String>{caller.id};
+          if (sourcePeer.isNotEmpty) {
+            excluded.add(sourcePeer);
+          }
+          await _broadcastNotificationMany(excluded, method, payload);
+        }
+      }
+
+      if (_hasID(reqID)) {
+        await _sendPeerResultAny(caller, reqID, entries);
+      }
+      return true;
+    }
+
+    var dispatchMethod = method;
+    var targetPeerID = hints.targetPeerID;
+
+    if (targetPeerID.isEmpty) {
+      final dispatchRoute = _router.parseDispatchRoute(method);
+      if (dispatchRoute != null && _router.hasHolon(dispatchRoute.holonName)) {
+        final resolvedPeer = _router.resolveHolon(
+          dispatchRoute.holonName,
+          excludePeerID: caller.id,
+        );
+        if (resolvedPeer == null) {
+          if (_hasID(reqID)) {
+            await _sendPeerError(
+              caller,
+              reqID,
+              _codeNotFound,
+              'holon "${dispatchRoute.holonName}" not found',
+            );
+          }
+          return true;
+        }
+        targetPeerID = resolvedPeer;
+        dispatchMethod = dispatchRoute.method;
+      }
+    }
+
+    if (targetPeerID.isEmpty) {
+      return false;
+    }
+
+    if (!_peers.containsKey(targetPeerID)) {
+      if (_hasID(reqID)) {
+        await _sendPeerError(
+          caller,
+          reqID,
+          _codeNotFound,
+          'peer "$targetPeerID" not found',
+        );
+      }
+      return true;
+    }
+
+    Map<String, dynamic> result;
+    try {
+      result = await invoke(targetPeerID, dispatchMethod, params: params);
+    } on HolonRPCResponseException catch (error) {
+      if (_hasID(reqID)) {
+        await _sendPeerError(
+          caller,
+          reqID,
+          error.code,
+          error.message,
+          error.data,
+        );
+      }
+      return true;
+    } catch (error) {
+      if (_hasID(reqID)) {
+        await _sendPeerError(caller, reqID, _codeUnavailable, error.toString());
+      }
+      return true;
+    }
+
+    if (hints.mode == _routeModeBroadcastResponse) {
+      await _broadcastNotificationMany(
+        <String>{caller.id, targetPeerID},
+        dispatchMethod,
+        <String, dynamic>{
+          'peer': targetPeerID,
+          'result': result,
+        },
+      );
+    }
+
+    if (_hasID(reqID)) {
+      await _sendPeerResult(caller, reqID, result);
+    }
+    return true;
+  }
+
+  Future<List<Map<String, dynamic>>> _dispatchFanOut(
+    _HolonRPCServerPeer caller,
+    String method,
+    Map<String, dynamic> params,
+  ) async {
+    final targets = _peers.keys
+        .where((peerID) => peerID != caller.id)
+        .toList(growable: false);
+    if (targets.isEmpty) {
+      throw HolonRPCResponseException(
+        code: _codeNotFound,
+        message: 'no connected peers',
+      );
+    }
+
+    final entries = <Map<String, dynamic>>[];
+    final jobs = <Future<void>>[];
+
+    for (final targetPeerID in targets) {
+      jobs.add(() async {
+        try {
+          final result = await invoke(targetPeerID, method, params: params);
+          entries.add(<String, dynamic>{
+            'peer': targetPeerID,
+            'result': result,
+          });
+        } on HolonRPCResponseException catch (error) {
+          entries.add(<String, dynamic>{
+            'peer': targetPeerID,
+            'error': _responseErrorToMap(error),
+          });
+        } catch (error) {
+          entries.add(<String, dynamic>{
+            'peer': targetPeerID,
+            'error': <String, dynamic>{
+              'code': _codeUnavailable,
+              'message': error.toString(),
+            },
+          });
+        }
+      }());
+    }
+
+    await Future.wait(jobs);
+    return entries;
+  }
+
+  Future<void> _broadcastNotificationMany(
+    Set<String> excludedPeerIDs,
+    String method,
+    Map<String, dynamic> payload,
+  ) async {
+    final peers = _peers.entries
+        .where((entry) => !excludedPeerIDs.contains(entry.key))
+        .map((entry) => entry.value)
+        .toList(growable: false);
+
+    for (final peer in peers) {
+      try {
+        await _writePeer(
+          peer,
+          <String, dynamic>{
+            'jsonrpc': _jsonRPCVersion,
+            'method': method,
+            'params': payload,
+          },
+        );
+      } catch (_) {
+        // Best-effort notifications.
+      }
+    }
+  }
+
+  Future<void> _handleRegister(
+    _HolonRPCServerPeer peer,
+    dynamic reqID,
+    Map<String, dynamic> params,
+  ) async {
+    final rawName = params['name'];
+    if (rawName is! String || rawName.trim().isEmpty) {
+      if (_hasID(reqID)) {
+        await _sendPeerError(
+          peer,
+          reqID,
+          _codeInvalidParams,
+          'name must be a non-empty string',
+        );
+      }
+      return;
+    }
+
+    final name = rawName.trim();
+    _router.registerHolon(peerID: peer.id, name: name);
+    if (_hasID(reqID)) {
+      await _sendPeerResult(
+        peer,
+        reqID,
+        <String, dynamic>{'peer': peer.id, 'name': name},
+      );
+    }
+  }
+
+  Future<void> _handleUnregister(
+    _HolonRPCServerPeer peer,
+    dynamic reqID,
+  ) async {
+    _router.deregisterHolon(peer.id);
+    if (_hasID(reqID)) {
+      await _sendPeerResult(peer, reqID, <String, dynamic>{});
+    }
+  }
+
+  Future<void> _sendPeerResult(
+    _HolonRPCServerPeer peer,
+    dynamic id,
+    Map<String, dynamic> result,
+  ) async {
+    await _sendPeerResultAny(peer, id, result);
+  }
+
+  Future<void> _sendPeerResultAny(
+    _HolonRPCServerPeer peer,
+    dynamic id,
+    Object? result,
+  ) async {
+    await _writePeer(
+      peer,
+      <String, dynamic>{
+        'jsonrpc': _jsonRPCVersion,
+        'id': id,
+        'result': result ?? <String, dynamic>{},
+      },
+    );
+  }
+
+  Future<void> _sendPeerError(
+    _HolonRPCServerPeer peer,
+    dynamic id,
+    int code,
+    String message, [
+    Object? data,
+    bool includeNullID = false,
+  ]) async {
+    await _writePeer(
+      peer,
+      <String, dynamic>{
+        'jsonrpc': _jsonRPCVersion,
+        if (id != null || includeNullID) 'id': id,
+        'error': <String, dynamic>{
+          'code': code,
+          'message': message,
+          if (data != null) 'data': data,
+        },
+      },
+    );
+  }
+
+  Future<void> _writePeer(
+    _HolonRPCServerPeer peer,
+    Map<String, dynamic> payload,
+  ) async {
+    if (peer.closed) {
+      throw StateError('holon-rpc connection closed');
+    }
+    peer.socket.add(jsonEncode(payload));
+  }
+
+  void _failPending(
+    _HolonRPCServerPeer peer,
+    HolonRPCResponseException error,
+  ) {
+    if (peer.pending.isEmpty) {
+      return;
+    }
+
+    final pending = peer.pending.values.toList(growable: false);
+    peer.pending.clear();
+    for (final completer in pending) {
+      if (!completer.isCompleted) {
+        completer.completeError(error);
+      }
+    }
+  }
+
+  _ParsedRoute _parseRouteHints(
+    String method,
+    Map<String, dynamic> params,
+  ) {
+    var dispatchMethod = method.trim();
+    if (dispatchMethod.isEmpty) {
+      throw HolonRPCResponseException(
+        code: _codeInvalidRequest,
+        message: 'invalid request',
+      );
+    }
+
+    final cleaned = Map<String, dynamic>.from(params);
+    var mode = _routeModeDefault;
+
+    if (cleaned.containsKey('_routing')) {
+      final rawMode = cleaned.remove('_routing');
+      if (rawMode is! String) {
+        throw HolonRPCResponseException(
+          code: _codeInvalidParams,
+          message: '_routing must be a string',
+        );
+      }
+      final trimmedMode = rawMode.trim();
+      if (trimmedMode != _routeModeDefault &&
+          trimmedMode != _routeModeBroadcastResponse &&
+          trimmedMode != _routeModeFullBroadcast) {
+        throw HolonRPCResponseException(
+          code: _codeInvalidParams,
+          message: 'unsupported _routing "$trimmedMode"',
+        );
+      }
+      mode = trimmedMode;
+    }
+
+    var targetPeerID = '';
+    if (cleaned.containsKey('_peer')) {
+      final rawPeerID = cleaned.remove('_peer');
+      if (rawPeerID is! String) {
+        throw HolonRPCResponseException(
+          code: _codeInvalidParams,
+          message: '_peer must be a string',
+        );
+      }
+      targetPeerID = rawPeerID.trim();
+      if (targetPeerID.isEmpty) {
+        throw HolonRPCResponseException(
+          code: _codeInvalidParams,
+          message: '_peer must be non-empty',
+        );
+      }
+    }
+
+    var fanOut = false;
+    if (dispatchMethod.startsWith('*.')) {
+      fanOut = true;
+      dispatchMethod = dispatchMethod.substring(2).trim();
+      if (dispatchMethod.isEmpty) {
+        throw HolonRPCResponseException(
+          code: _codeInvalidRequest,
+          message: 'invalid fan-out method',
+        );
+      }
+    }
+
+    if (mode == _routeModeFullBroadcast && !fanOut) {
+      throw HolonRPCResponseException(
+        code: _codeInvalidParams,
+        message: 'full-broadcast requires a fan-out method',
+      );
+    }
+
+    return _ParsedRoute(
+      method: dispatchMethod,
+      fanOut: fanOut,
+      params: cleaned,
+      hints: _RouteHints(targetPeerID: targetPeerID, mode: mode),
+    );
+  }
+
+  Map<String, dynamic> _decodeParams(Object? rawParams) {
+    if (rawParams == null) {
+      return <String, dynamic>{};
+    }
+    if (rawParams is Map<String, dynamic>) {
+      return Map<String, dynamic>.from(rawParams);
+    }
+    if (rawParams is Map) {
+      return rawParams.cast<String, dynamic>();
+    }
+
+    throw HolonRPCResponseException(
+      code: _codeInvalidParams,
+      message: 'params must be an object',
+    );
+  }
+}
+
+class _HolonRPCServerPeer {
+  _HolonRPCServerPeer(this.id, this.socket);
+
+  final String id;
+  final WebSocket socket;
+  final Map<String, Completer<Map<String, dynamic>>> pending =
+      <String, Completer<Map<String, dynamic>>>{};
+  StreamSubscription<dynamic>? subscription;
+  bool closed = false;
+
+  Future<void> dispose({required bool closeSocket}) async {
+    if (closed) {
+      return;
+    }
+    closed = true;
+
+    final sub = subscription;
+    subscription = null;
+    await sub?.cancel();
+
+    if (closeSocket) {
+      try {
+        await socket.close(WebSocketStatus.goingAway, 'server shutdown');
+      } catch (_) {}
+    }
+  }
+}
+
+class _RouteHints {
+  const _RouteHints({
+    required this.targetPeerID,
+    required this.mode,
+  });
+
+  final String targetPeerID;
+  final String mode;
+}
+
+class _ParsedRoute {
+  const _ParsedRoute({
+    required this.method,
+    required this.fanOut,
+    required this.params,
+    required this.hints,
+  });
+
+  final String method;
+  final bool fanOut;
+  final Map<String, dynamic> params;
+  final _RouteHints hints;
+}
+
+Map<String, dynamic> _normalizeResult(Object? rawResult) {
+  if (rawResult == null) {
+    return <String, dynamic>{};
+  }
+  if (rawResult is Map<String, dynamic>) {
+    return rawResult;
+  }
+  if (rawResult is Map) {
+    return rawResult.cast<String, dynamic>();
+  }
+  return <String, dynamic>{'value': rawResult};
+}
+
+Map<String, dynamic> _responseErrorToMap(HolonRPCResponseException error) {
+  return <String, dynamic>{
+    'code': error.code,
+    'message': error.message,
+    if (error.data != null) 'data': error.data,
+  };
+}
+
+String _formatHostForURL(String host) {
+  if (host.contains(':') && !host.startsWith('[') && !host.endsWith(']')) {
+    return '[$host]';
+  }
+  return host;
+}
+
+bool _hasExplicitPortInURL(String rawURL) {
+  final schemeSeparator = rawURL.indexOf('://');
+  if (schemeSeparator < 0 || schemeSeparator + 3 >= rawURL.length) {
+    return false;
+  }
+
+  final afterScheme = rawURL.substring(schemeSeparator + 3);
+  final slashIndex = afterScheme.indexOf('/');
+  final authority =
+      slashIndex >= 0 ? afterScheme.substring(0, slashIndex) : afterScheme;
+
+  if (authority.isEmpty) {
+    return false;
+  }
+  if (authority.startsWith('[')) {
+    final closing = authority.indexOf(']');
+    if (closing < 0 || closing >= authority.length - 1) {
+      return false;
+    }
+    return authority[closing + 1] == ':';
+  }
+  return authority.lastIndexOf(':') > 0;
+}
+
+bool _hasID(Object? id) {
+  return id != null;
 }

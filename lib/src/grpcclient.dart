@@ -7,9 +7,14 @@ import 'package:http2/transport.dart';
 /// gRPC transport connector backed by a child process's stdin/stdout pipes.
 ///
 /// Mirrors go-holons/pkg/grpcclient.DialStdio.
-/// The child process must speak gRPC (HTTP/2) on its stdin/stdout - this is
+/// The child process must speak gRPC (HTTP/2) on its stdin/stdout — this is
 /// the standard behavior of any holon started with
 /// `serve --listen stdio://`.
+///
+/// Unlike TCP sockets, process pipes are single-use: stdout is a
+/// single-subscription stream. The connector caches the transport
+/// connection and returns the same instance on every call to [connect],
+/// matching Go's `sync.Once` pattern in `pipeConn`.
 class StdioTransportConnector implements ClientTransportConnector {
   StdioTransportConnector._(this._process) {
     _process.exitCode.then((_) {
@@ -21,6 +26,7 @@ class StdioTransportConnector implements ClientTransportConnector {
 
   final Process _process;
   final Completer<void> _done = Completer<void>();
+  ClientTransportConnection? _cachedConnection;
 
   /// Spawn [binaryPath] with the given [args] and return a connector.
   ///
@@ -35,12 +41,18 @@ class StdioTransportConnector implements ClientTransportConnector {
 
   @override
   Future<ClientTransportConnection> connect() async {
-    // process.stdout = server -> client (incoming)
-    // process.stdin  = client -> server (outgoing)
-    return ClientTransportConnection.viaStreams(
+    // Process pipes are single-subscription: stdout can only be listened
+    // to once. Cache the connection like Go's sync.Once dialer.
+    if (_cachedConnection != null) {
+      return _cachedConnection!;
+    }
+    // process.stdout = server → client (incoming)
+    // process.stdin  = client → server (outgoing)
+    _cachedConnection = ClientTransportConnection.viaStreams(
       _process.stdout,
       _process.stdin,
     );
+    return _cachedConnection!;
   }
 
   @override
@@ -62,11 +74,15 @@ class StdioTransportConnector implements ClientTransportConnector {
 ///
 /// Returns both the channel and the process so the caller can manage
 /// the child process lifecycle (kill on shutdown, etc.).
+///
+/// Idle timeout is disabled by default because stdio pipes are
+/// single-connection transports that cannot be re-established.
 Future<(ClientTransportConnectorChannel, Process)> dialStdio(
   String binaryPath, {
   List<String>? args,
   ChannelOptions options = const ChannelOptions(
     credentials: ChannelCredentials.insecure(),
+    idleTimeout: null,
   ),
 }) async {
   final connector = await StdioTransportConnector.spawn(

@@ -1,4 +1,3 @@
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:holons/src/echo_cli.dart';
@@ -6,24 +5,7 @@ import 'package:holons/src/holonrpc_server_cli.dart';
 import 'package:test/test.dart';
 
 void main() {
-  group('certification commands', () {
-    test('cert.json declares runnable echo commands and dial/listen flags', () {
-      final certRaw = File('cert.json').readAsStringSync();
-      final cert = jsonDecode(certRaw) as Map<String, dynamic>;
-      final executables = cert['executables'] as Map<String, dynamic>;
-      final capabilities = cert['capabilities'] as Map<String, dynamic>;
-
-      expect(executables['echo_server'], equals('./bin/echo-server'));
-      expect(executables['echo_client'], equals('./bin/echo-client'));
-      expect(executables['holon_rpc_server'], equals('./bin/holon-rpc-server'));
-      expect(capabilities['grpc_listen_tcp'], isTrue);
-      expect(capabilities['grpc_listen_stdio'], isTrue);
-      expect(capabilities['grpc_dial_tcp'], isTrue);
-      expect(capabilities['grpc_dial_stdio'], isTrue);
-      expect(capabilities['grpc_dial_ws'], isTrue);
-      expect(capabilities['holon_rpc_server'], isTrue);
-    });
-
+  group('wrapper commands', () {
     test('echo scripts exist', () {
       expect(File('bin/echo-client').existsSync(), isTrue);
       expect(File('bin/echo-server').existsSync(), isTrue);

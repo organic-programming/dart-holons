@@ -1,7 +1,7 @@
 import 'dart:io';
 import 'package:yaml/yaml.dart';
 
-/// Parsed holon identity from HOLON.md.
+/// Parsed holon identity from holon.yaml.
 class HolonIdentity {
   final String uuid;
   final String givenName;
@@ -36,22 +36,14 @@ class HolonIdentity {
   });
 }
 
-/// Parse a HOLON.md file.
+/// Parse a holon.yaml file.
 HolonIdentity parseHolon(String path) {
   final text = File(path).readAsStringSync();
-
-  if (!text.startsWith('---')) {
-    throw FormatException('$path: missing YAML frontmatter');
+  final raw = loadYaml(text);
+  if (raw is! YamlMap) {
+    throw FormatException('$path: holon.yaml must be a YAML mapping');
   }
-
-  final endIdx = text.indexOf('---', 3);
-  if (endIdx < 0) {
-    throw FormatException('$path: unterminated frontmatter');
-  }
-
-  final frontmatter = text.substring(3, endIdx).trim();
-  final raw = loadYaml(frontmatter);
-  final data = raw is YamlMap ? raw : YamlMap();
+  final data = raw;
 
   return HolonIdentity(
     uuid: (data['uuid'] ?? '').toString(),

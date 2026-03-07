@@ -176,16 +176,15 @@ void main() {
   });
 
   group('identity', () {
-    test('parseHolon parses HOLON.md', () {
-      final tmp = File('${Directory.systemTemp.path}/test_holon_dart.md');
+    test('parseHolon parses holon.yaml', () {
+      final tmp = File('${Directory.systemTemp.path}/holon_dart.yaml');
       tmp.writeAsStringSync(
-        '---\nuuid: "abc-123"\ngiven_name: "test"\n'
+        'uuid: "abc-123"\ngiven_name: "test"\n'
         'family_name: "Test"\nlang: "dart"\n'
         'parents: ["a", "b"]\n'
         'generated_by: "sophia-who"\n'
         'proto_status: draft\n'
-        'aliases: ["d1"]\n'
-        '---\n# test\n',
+        'aliases: ["d1"]\n',
       );
 
       final id = parseHolon(tmp.path);
@@ -200,9 +199,9 @@ void main() {
       tmp.deleteSync();
     });
 
-    test('parseHolon throws for missing frontmatter', () {
-      final tmp = File('${Directory.systemTemp.path}/no_fm_dart.md');
-      tmp.writeAsStringSync('# No frontmatter\n');
+    test('parseHolon throws for invalid mapping', () {
+      final tmp = File('${Directory.systemTemp.path}/invalid_holon_dart.yaml');
+      tmp.writeAsStringSync('- not\n- a\n- mapping\n');
       expect(() => parseHolon(tmp.path), throwsFormatException);
       tmp.deleteSync();
     });

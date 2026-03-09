@@ -16,7 +16,7 @@ import 'package:http2/transport.dart';
 /// connection and returns the same instance on every call to [connect],
 /// matching Go's `sync.Once` pattern in `pipeConn`.
 class StdioTransportConnector implements ClientTransportConnector {
-  StdioTransportConnector._(this._process) {
+  StdioTransportConnector.fromProcess(this._process) {
     _process.exitCode.then((_) {
       if (!_done.isCompleted) {
         _done.complete();
@@ -36,7 +36,7 @@ class StdioTransportConnector implements ClientTransportConnector {
     List<String> args = const <String>['serve', '--listen', 'stdio://'],
   }) async {
     final process = await Process.start(binaryPath, args);
-    return StdioTransportConnector._(process);
+    return StdioTransportConnector.fromProcess(process);
   }
 
   @override

@@ -1,9 +1,12 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:holons/holons.dart';
 import 'package:test/test.dart';
 
 void main() {
+  final sdkRoot = Directory.current.path;
+
   group('discover', () {
     test('recurses skips and dedups by uuid', () async {
       final root = Directory.systemTemp.createTempSync('holons_discover_dart_');
@@ -58,23 +61,35 @@ void main() {
         ),
       );
 
-      final original = Directory.current;
-      Directory.current = root.path;
+      final runner = _writeDiscoverRunnerScript(sdkRoot);
       addTearDown(() {
-        Directory.current = original;
+        if (runner.existsSync()) {
+          runner.deleteSync();
+        }
       });
 
-      final local = await discoverLocal();
-      expect(local, hasLength(1));
-      expect(local.single.slug, equals('rob-go'));
+      final result = await Process.run(
+        Platform.resolvedExecutable,
+        <String>[runner.path],
+        workingDirectory: root.path,
+      );
+      expect(
+        result.exitCode,
+        equals(0),
+        reason:
+            'discover runner failed:\nstdout:\n${result.stdout}\nstderr:\n${result.stderr}',
+      );
 
-      final bySlug = await findBySlug('rob-go');
-      expect(bySlug?.uuid, equals('c7f3a1b2-1111-1111-1111-111111111111'));
-
-      final byUuid = await findByUUID('c7f3a1b2');
-      expect(byUuid?.slug, equals('rob-go'));
-
-      expect(await findBySlug('missing'), isNull);
+      final decoded =
+          jsonDecode((result.stdout as String).trim()) as Map<String, dynamic>;
+      expect(decoded['localLength'], equals(1));
+      expect(decoded['localSlug'], equals('rob-go'));
+      expect(
+        decoded['bySlugUuid'],
+        equals('c7f3a1b2-1111-1111-1111-111111111111'),
+      );
+      expect(decoded['byUuidSlug'], equals('rob-go'));
+      expect(decoded['missing'], isNull);
     });
   });
 }
@@ -108,4 +123,32 @@ build:
 artifacts:
   binary: ${seed.binary}
 ''');
+}
+
+File _writeDiscoverRunnerScript(String sdkRoot) {
+  final runner = File(
+    '$sdkRoot/.dart_tool/discover-runner-${DateTime.now().microsecondsSinceEpoch}.dart',
+  );
+  runner.parent.createSync(recursive: true);
+  runner.writeAsStringSync('''
+import 'dart:convert';
+
+import 'package:holons/holons.dart';
+
+Future<void> main() async {
+  final local = await discoverLocal();
+  final bySlug = await findBySlug('rob-go');
+  final byUuid = await findByUUID('c7f3a1b2');
+  final missing = await findBySlug('missing');
+
+  print(jsonEncode(<String, Object?>{
+    'localLength': local.length,
+    'localSlug': local.single.slug,
+    'bySlugUuid': bySlug?.uuid,
+    'byUuidSlug': byUuid?.slug,
+    'missing': missing?.slug,
+  }));
+}
+''');
+  return runner;
 }

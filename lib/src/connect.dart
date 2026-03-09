@@ -3,8 +3,12 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:grpc/grpc.dart';
+import 'package:grpc/src/client/connection.dart' show ClientConnection;
+import 'package:grpc/src/client/http2_connection.dart'
+    show Http2ClientConnection;
 
 import 'discover.dart';
+import 'grpcclient.dart';
 import 'transport.dart';
 
 class ConnectOptions {
@@ -15,7 +19,7 @@ class ConnectOptions {
 
   const ConnectOptions({
     this.timeout = const Duration(seconds: 5),
-    this.transport = 'tcp',
+    this.transport = 'stdio',
     this.start = true,
     this.portFile = '',
   });
@@ -29,6 +33,21 @@ class _StartedHandle {
 }
 
 final Expando<_StartedHandle> _started = Expando<_StartedHandle>('connect');
+const ChannelOptions _stdioChannelOptions = ChannelOptions(
+  credentials: ChannelCredentials.insecure(),
+  idleTimeout: null,
+);
+
+class _StdioClientChannel extends ClientChannel {
+  final StdioTransportConnector _connector;
+
+  _StdioClientChannel(this._connector)
+      : super('localhost', port: 0, options: _stdioChannelOptions);
+
+  @override
+  ClientConnection createConnection() =>
+      Http2ClientConnection.fromClientTransportConnector(_connector, options);
+}
 
 Future<ClientChannel> connect(String target, [ConnectOptions? opts]) async {
   final trimmed = target.trim();
@@ -37,11 +56,6 @@ Future<ClientChannel> connect(String target, [ConnectOptions? opts]) async {
   }
 
   final options = _normalizeOptions(opts);
-  final ephemeral = opts == null;
-
-  if (options.transport != 'tcp') {
-    throw UnsupportedError('dart-holons connect() currently supports tcp only');
-  }
 
   if (_isDirectTarget(trimmed)) {
     return _dialReady(_normalizeDialTarget(trimmed), options.timeout);
@@ -65,24 +79,33 @@ Future<ClientChannel> connect(String target, [ConnectOptions? opts]) async {
   }
 
   final binaryPath = _resolveBinaryPath(entry);
-  final started = await _startTcpHolon(binaryPath, options.timeout);
-  final channel = await _dialReady(
-    _normalizeDialTarget(started.$1),
-    options.timeout,
-  );
+  switch (options.transport) {
+    case 'stdio':
+      final started = await _startStdioHolon(binaryPath);
+      _started[started.$1] = _StartedHandle(started.$2, true);
+      return started.$1;
 
-  if (!ephemeral) {
-    try {
-      await _writePortFile(portFile, started.$1);
-    } catch (_) {
-      await channel.shutdown();
-      _stopProcess(started.$2);
-      rethrow;
-    }
+    case 'tcp':
+      final started = await _startTcpHolon(binaryPath, options.timeout);
+      final channel = await _dialReady(
+        _normalizeDialTarget(started.$1),
+        options.timeout,
+      );
+
+      try {
+        await _writePortFile(portFile, started.$1);
+      } catch (_) {
+        await channel.shutdown();
+        _stopProcess(started.$2);
+        rethrow;
+      }
+
+      _started[channel] = _StartedHandle(started.$2, false);
+      return channel;
+
+    default:
+      throw UnsupportedError('unsupported transport "${options.transport}"');
   }
-
-  _started[channel] = _StartedHandle(started.$2, ephemeral);
-  return channel;
 }
 
 Future<void> disconnect(ClientChannel channel) async {
@@ -97,7 +120,7 @@ Future<void> disconnect(ClientChannel channel) async {
 ConnectOptions _normalizeOptions(ConnectOptions? opts) {
   final options = opts ?? const ConnectOptions();
   final transportName = options.transport.trim().isEmpty
-      ? 'tcp'
+      ? 'stdio'
       : options.transport.trim().toLowerCase();
   return ConnectOptions(
     timeout: options.timeout <= Duration.zero
@@ -144,7 +167,8 @@ Future<void> _waitForTcpReady(String host, int port, Duration timeout) async {
   throw StateError('timed out waiting for gRPC readiness');
 }
 
-Future<ClientChannel?> _usablePortFile(String portFile, Duration timeout) async {
+Future<ClientChannel?> _usablePortFile(
+    String portFile, Duration timeout) async {
   try {
     final raw = (await File(portFile).readAsString()).trim();
     if (raw.isEmpty) {
@@ -153,7 +177,9 @@ Future<ClientChannel?> _usablePortFile(String portFile, Duration timeout) async 
     }
     return _dialReady(
       _normalizeDialTarget(raw),
-      timeout < const Duration(seconds: 1) ? timeout : const Duration(seconds: 1),
+      timeout < const Duration(seconds: 1)
+          ? timeout
+          : const Duration(seconds: 1),
     );
   } on Object {
     final file = File(portFile);
@@ -164,15 +190,27 @@ Future<ClientChannel?> _usablePortFile(String portFile, Duration timeout) async 
   }
 }
 
-Future<(String, Process)> _startTcpHolon(String binaryPath, Duration timeout) async {
+Future<(ClientChannel, Process)> _startStdioHolon(String binaryPath) async {
+  final process = await Process.start(
+    binaryPath,
+    const <String>['serve', '--listen', 'stdio://'],
+  );
+  unawaited(process.stderr.drain<void>());
+
+  final connector = StdioTransportConnector.fromProcess(process);
+  final channel = _StdioClientChannel(connector);
+  return (channel, process);
+}
+
+Future<(String, Process)> _startTcpHolon(
+    String binaryPath, Duration timeout) async {
   final process = await Process.start(
     binaryPath,
     const <String>['serve', '--listen', 'tcp://127.0.0.1:0'],
   );
 
   final completer = Completer<String>();
-  final stdoutSub = utf8
-      .decoder
+  final stdoutSub = utf8.decoder
       .bind(process.stdout)
       .transform(const LineSplitter())
       .listen((line) {
@@ -181,8 +219,7 @@ Future<(String, Process)> _startTcpHolon(String binaryPath, Duration timeout) as
       completer.complete(uri);
     }
   });
-  final stderrSub = utf8
-      .decoder
+  final stderrSub = utf8.decoder
       .bind(process.stderr)
       .transform(const LineSplitter())
       .listen((line) {
@@ -231,14 +268,16 @@ String _resolveBinaryPath(HolonEntry entry) {
 
   final candidate =
       '${entry.dir}${Platform.pathSeparator}.op${Platform.pathSeparator}build${Platform.pathSeparator}bin${Platform.pathSeparator}${binary.split(Platform.pathSeparator).last}'
-          .replaceAll('${Platform.pathSeparator}${Platform.pathSeparator}', Platform.pathSeparator);
+          .replaceAll('${Platform.pathSeparator}${Platform.pathSeparator}',
+              Platform.pathSeparator);
   if (File(candidate).existsSync()) {
     return candidate;
   }
 
   final resolved = Platform.environment['PATH']
       ?.split(Platform.isWindows ? ';' : ':')
-      .map((dir) => '$dir${Platform.pathSeparator}${binary.split(Platform.pathSeparator).last}')
+      .map((dir) =>
+          '$dir${Platform.pathSeparator}${binary.split(Platform.pathSeparator).last}')
       .firstWhere((file) => File(file).existsSync(), orElse: () => '');
   if (resolved != null && resolved.isNotEmpty) {
     return resolved;
@@ -267,7 +306,8 @@ Future<void> _stopProcess(Process process) async {
   );
 }
 
-bool _isDirectTarget(String target) => target.contains('://') || target.contains(':');
+bool _isDirectTarget(String target) =>
+    target.contains('://') || target.contains(':');
 
 String _normalizeDialTarget(String target) {
   if (!target.contains('://')) {
@@ -276,7 +316,9 @@ String _normalizeDialTarget(String target) {
 
   final parsed = parseUri(target);
   if (parsed.scheme == 'tcp') {
-    final host = (parsed.host == null || parsed.host!.isEmpty || parsed.host == '0.0.0.0')
+    final host = (parsed.host == null ||
+            parsed.host!.isEmpty ||
+            parsed.host == '0.0.0.0')
         ? '127.0.0.1'
         : parsed.host!;
     return '$host:${parsed.port}';

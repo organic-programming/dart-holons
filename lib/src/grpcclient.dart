@@ -89,6 +89,7 @@ Future<(ClientTransportConnectorChannel, Process)> dialStdio(
     binaryPath,
     args: args ?? const <String>['serve', '--listen', 'stdio://'],
   );
+  unawaited(connector.process.stderr.drain<void>());
   final channel = ClientTransportConnectorChannel(connector, options: options);
   return (channel, connector.process);
 }

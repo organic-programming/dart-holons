@@ -91,6 +91,51 @@ void main() {
       expect(decoded['byUuidSlug'], equals('rob-go'));
       expect(decoded['missing'], isNull);
     });
+
+    test('skips unreadable directories', () async {
+      if (Platform.isWindows) {
+        return;
+      }
+
+      final root = Directory.systemTemp.createTempSync('holons_unreadable_');
+      final locked = Directory('${root.path}/locked')..createSync();
+      addTearDown(() {
+        Process.runSync('chmod', <String>['755', locked.path]);
+        root.deleteSync(recursive: true);
+      });
+
+      _writeHolon(
+        root.path,
+        'readable',
+        const _HolonSeed(
+          '3d7fe412-8f34-44d7-8ef2-b222f25c1dbb',
+          'Readable',
+          'Go',
+          'readable-go',
+        ),
+      );
+      _writeHolon(
+        root.path,
+        'locked/hidden',
+        const _HolonSeed(
+          'd4f62503-c6e2-4874-a607-e58d0c993f68',
+          'Hidden',
+          'Go',
+          'hidden-go',
+        ),
+      );
+
+      final chmod = Process.runSync('chmod', <String>['000', locked.path]);
+      expect(
+        chmod.exitCode,
+        equals(0),
+        reason: 'chmod failed: ${chmod.stderr}',
+      );
+
+      final entries = await discover(root.path);
+      expect(entries, hasLength(1));
+      expect(entries.single.slug, equals('readable-go'));
+    });
   });
 }
 

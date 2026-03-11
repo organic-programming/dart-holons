@@ -135,7 +135,14 @@ Future<List<HolonEntry>> _discoverInRoot(String root, String origin) async {
   final orderedKeys = <String>[];
 
   void scan(Directory current) {
-    for (final entity in current.listSync(followLinks: false)) {
+    List<FileSystemEntity> entities;
+    try {
+      entities = current.listSync(followLinks: false);
+    } on FileSystemException {
+      return;
+    }
+
+    for (final entity in entities) {
       final path = _normalizeAbsolutePath(entity.path);
       final name = _basename(path);
       if (entity is Directory) {

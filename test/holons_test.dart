@@ -182,7 +182,7 @@ void main() {
         'uuid: "abc-123"\ngiven_name: "test"\n'
         'family_name: "Test"\nlang: "dart"\n'
         'parents: ["a", "b"]\n'
-        'generated_by: "sophia-who"\n'
+        'generated_by: "dummy-test"\n'
         'proto_status: draft\n'
         'aliases: ["d1"]\n',
       );
@@ -192,7 +192,7 @@ void main() {
       expect(id.givenName, equals('test'));
       expect(id.lang, equals('dart'));
       expect(id.parents, equals(<String>['a', 'b']));
-      expect(id.generatedBy, equals('sophia-who'));
+      expect(id.generatedBy, equals('dummy-test'));
       expect(id.protoStatus, equals('draft'));
       expect(id.aliases, equals(<String>['d1']));
 

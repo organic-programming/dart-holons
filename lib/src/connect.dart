@@ -104,6 +104,26 @@ Future<ClientChannel> connect(String target, [ConnectOptions? opts]) async {
       _started[channel] = _StartedHandle(started.$2, false);
       return channel;
 
+    case 'unix':
+      final started = await _startUnixHolon(
+        binaryPath,
+        entry.slug,
+        portFile,
+        options.timeout,
+      );
+      final channel = await _dialReady(started.$1, options.timeout);
+
+      try {
+        await _writePortFile(portFile, started.$1);
+      } catch (_) {
+        await channel.shutdown();
+        await _stopProcess(started.$2);
+        rethrow;
+      }
+
+      _started[channel] = _StartedHandle(started.$2, false);
+      return channel;
+
     default:
       throw UnsupportedError('unsupported transport "${options.transport}"');
   }
@@ -134,6 +154,16 @@ ConnectOptions _normalizeOptions(ConnectOptions? opts) {
 }
 
 Future<ClientChannel> _dialReady(String target, Duration timeout) async {
+  if (target.startsWith('unix://')) {
+    final socketPath = target.substring('unix://'.length);
+    await _waitForUnixReady(socketPath, timeout);
+    return ClientChannel(
+      InternetAddress(socketPath, type: InternetAddressType.unix),
+      port: 0,
+      options: const ChannelOptions(credentials: ChannelCredentials.insecure()),
+    );
+  }
+
   final parsed = _parseHostPort(target);
   final channel = ClientChannel(
     parsed.$1,
@@ -166,6 +196,31 @@ Future<void> _waitForTcpReady(String host, int port, Duration timeout) async {
     }
   }
   throw StateError('timed out waiting for gRPC readiness');
+}
+
+Future<void> _waitForUnixReady(String path, Duration timeout) async {
+  final deadline = DateTime.now().add(timeout);
+  while (DateTime.now().isBefore(deadline)) {
+    if (await _probeUnixReady(path)) {
+      return;
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+  }
+  throw StateError('timed out waiting for unix gRPC readiness');
+}
+
+Future<bool> _probeUnixReady(String path) async {
+  try {
+    final socket = await Socket.connect(
+      InternetAddress(path, type: InternetAddressType.unix),
+      0,
+      timeout: const Duration(milliseconds: 200),
+    );
+    socket.destroy();
+    return true;
+  } on Object {
+    return false;
+  }
 }
 
 Future<ClientChannel?> _usablePortFile(
@@ -272,6 +327,64 @@ Future<(String, Process)> _startTcpHolon(
   }
 }
 
+Future<(String, Process)> _startUnixHolon(
+  String binaryPath,
+  String slug,
+  String portFile,
+  Duration timeout,
+) async {
+  final uri = _defaultUnixSocketURI(slug, portFile);
+  final socketPath = uri.substring('unix://'.length);
+  final socketFile = File(socketPath);
+  if (socketFile.existsSync()) {
+    try {
+      socketFile.deleteSync();
+    } catch (_) {}
+  }
+
+  final process = await Process.start(
+    binaryPath,
+    <String>['serve', '--listen', uri],
+  );
+
+  final recentLines = <String>[];
+  utf8.decoder
+      .bind(process.stderr)
+      .transform(const LineSplitter())
+      .listen((line) {
+    if (recentLines.length == 8) {
+      recentLines.removeAt(0);
+    }
+    recentLines.add(line);
+  });
+
+  var exited = false;
+  var exitCode = 0;
+  unawaited(process.exitCode.then((code) {
+    exited = true;
+    exitCode = code;
+  }));
+
+  final deadline = DateTime.now().add(timeout);
+  while (DateTime.now().isBefore(deadline)) {
+    if (socketFile.existsSync() && await _probeUnixReady(socketPath)) {
+      return (uri, process);
+    }
+    if (exited) {
+      final details = _recentLineDetails(recentLines);
+      throw StateError('holon exited before binding unix socket ($exitCode)$details');
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+  }
+
+  try {
+    await _stopProcess(process);
+  } catch (_) {}
+  throw StateError(
+    'timed out waiting for unix holon startup${_recentLineDetails(recentLines)}',
+  );
+}
+
 String _resolveBinaryPath(HolonEntry entry) {
   final manifest = entry.manifest;
   if (manifest == null) {
@@ -312,6 +425,12 @@ String _resolveBinaryPath(HolonEntry entry) {
 String _defaultPortFilePath(String slug) =>
     '${Directory.current.path}${Platform.pathSeparator}.op${Platform.pathSeparator}run${Platform.pathSeparator}$slug.port';
 
+String _defaultUnixSocketURI(String slug, String portFile) {
+  final label = _socketLabel(slug);
+  final hash = _fnv1a64(utf8.encode(portFile)) & 0xFFFFFFFFFFFF;
+  return 'unix:///tmp/holons-$label-${hash.toRadixString(16).padLeft(12, '0')}.sock';
+}
+
 Future<void> _writePortFile(String portFile, String uri) async {
   final file = File(portFile);
   await file.parent.create(recursive: true);
@@ -334,6 +453,43 @@ String _recentLineDetails(List<String> recentLines) {
     return '';
   }
   return ': ${recentLines.join(' | ')}';
+}
+
+String _socketLabel(String slug) {
+  final buffer = StringBuffer();
+  var lastWasDash = false;
+
+  for (final rune in slug.trim().toLowerCase().runes) {
+    final char = String.fromCharCode(rune);
+    final isAsciiLetter = rune >= 97 && rune <= 122;
+    final isDigit = rune >= 48 && rune <= 57;
+    if (isAsciiLetter || isDigit) {
+      buffer.write(char);
+      lastWasDash = false;
+    } else if ((char == '-' || char == '_') &&
+        buffer.isNotEmpty &&
+        !lastWasDash) {
+      buffer.write('-');
+      lastWasDash = true;
+    }
+
+    if (buffer.length >= 24) {
+      break;
+    }
+  }
+
+  final label = buffer.toString().replaceAll(RegExp(r'^-+|-+$'), '');
+  return label.isEmpty ? 'socket' : label;
+}
+
+int _fnv1a64(List<int> bytes) {
+  var hash = 0xcbf29ce484222325;
+  const prime = 0x100000001b3;
+  for (final byte in bytes) {
+    hash ^= byte & 0xff;
+    hash = (hash * prime) & 0xFFFFFFFFFFFFFFFF;
+  }
+  return hash;
 }
 
 bool _isDirectTarget(String target) =>

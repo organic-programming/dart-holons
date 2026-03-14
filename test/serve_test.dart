@@ -43,6 +43,37 @@ void main() {
         root.deleteSync(recursive: true);
       }
     });
+
+    test('startWithOptions advertises unix and auto-registers describe', () async {
+      final root = _writeEchoHolon();
+      final previous = Directory.current;
+      Directory.current = root;
+
+      try {
+        final socketPath = '${root.path}/serve.sock';
+        final running = await startWithOptions(
+          'unix://$socketPath',
+          const <Service>[],
+        );
+        final channel = await connect('unix://$socketPath');
+
+        try {
+          final client = HolonMetaClient(channel);
+          final response = await client.describe(DescribeRequest());
+
+          expect(running.publicUri, equals('unix://$socketPath'));
+          expect(response.slug, equals('echo-server'));
+          expect(response.services, hasLength(1));
+          expect(response.services.single.name, equals('echo.v1.Echo'));
+        } finally {
+          await disconnect(channel);
+          await running.stop();
+        }
+      } finally {
+        Directory.current = previous;
+        root.deleteSync(recursive: true);
+      }
+    });
   });
 }
 

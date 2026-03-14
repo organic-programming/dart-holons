@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:grpc/grpc.dart';
 import 'package:holons/holons.dart';
 import 'package:test/test.dart';
 
@@ -90,6 +91,74 @@ void main() {
   });
 
   test(
+    'connect(slug) writes a unix port file and reuses the daemon',
+    () async {
+      final sandbox =
+          Directory.systemTemp.createTempSync('dart-holons-connect-unix');
+      addTearDown(() => sandbox.delete(recursive: true));
+
+      final fixture = _writeHolonFixture(
+        sandbox,
+        echoServerPath,
+        slug: 'connect-unix',
+      );
+      final previous = Directory.current;
+      Directory.current = sandbox;
+
+      try {
+        final channel = await connect(
+          fixture.slug,
+          const ConnectOptions(
+            timeout: Duration(seconds: 5),
+            transport: 'unix',
+            start: true,
+          ),
+        );
+        final pid = await _waitForPid(fixture.pidFile);
+
+        try {
+          final response = await _invokePing(channel, 'unix-dart');
+          expect(response['message'], equals('unix-dart'));
+          expect(
+            await _waitForFileContents(fixture.argsFile),
+            startsWith('serve --listen unix:///tmp/holons-'),
+          );
+          final target = await _waitForFileContents(fixture.portFile);
+          expect(target, startsWith('unix:///tmp/holons-'));
+        } finally {
+          await disconnect(channel);
+        }
+
+        final reused = await connect(
+          fixture.slug,
+          const ConnectOptions(
+            timeout: Duration(seconds: 5),
+            transport: 'unix',
+            start: false,
+          ),
+        );
+
+        try {
+          final response = await _invokePing(reused, 'unix-dart-reuse');
+          expect(response['message'], equals('unix-dart-reuse'));
+        } finally {
+          await disconnect(reused);
+        }
+
+        final result = await Process.run('/bin/kill', <String>['-TERM', '$pid']);
+        expect(result.exitCode, anyOf(equals(0), equals(1)));
+        await _waitForProcessExit(pid);
+      } finally {
+        Directory.current = previous;
+      }
+    },
+    timeout: const Timeout(Duration(seconds: 20)),
+    skip: Platform.isWindows
+        ? 'connect unix fixture uses a POSIX shell wrapper'
+        : false,
+  );
+
+  test(
     'connect(slug) fails fast when a stdio child exits during startup',
     () async {
       final sandbox =
@@ -147,8 +216,16 @@ class _ConnectFixture {
   });
 }
 
-_ConnectFixture _writeHolonFixture(Directory sandbox, String echoServerPath) {
-  const slug = 'connect-stdio';
+_ConnectFixture _writeHolonFixture(
+  Directory sandbox,
+  String echoServerPath, {
+  String slug = 'connect-stdio',
+}) {
+  final slugParts = slug.split('-').where((part) => part.isNotEmpty).toList();
+  final givenName = slugParts.isNotEmpty ? _titleCase(slugParts.first) : 'Connect';
+  final familyName = slugParts.length > 1
+      ? slugParts.skip(1).map(_titleCase).join('-')
+      : 'Stdio';
   final holonDir = Directory('${sandbox.path}/holons/$slug')
     ..createSync(recursive: true);
   final binDir = Directory('${holonDir.path}/.op/build/bin')
@@ -168,9 +245,9 @@ exec ${_shellQuote(echoServerPath)} "\$@"
 
   File('${holonDir.path}/holon.yaml').writeAsStringSync('''
 schema: holon/v0
-uuid: "connect-stdio-0000-0000-0000-000000000001"
-given_name: "Connect"
-family_name: "Stdio"
+uuid: "$slug-0000-0000-0000-000000000001"
+given_name: "$givenName"
+family_name: "$familyName"
 motto: "Round-trip."
 composer: "dart-holons-tests"
 kind: native
@@ -313,6 +390,27 @@ Future<bool> _pidExists(int pid) async {
   return result.exitCode == 0;
 }
 
+Future<Map<String, dynamic>> _invokePing(
+  ClientChannel channel,
+  String message,
+) async {
+  final method = ClientMethod<Map<String, dynamic>, Map<String, dynamic>>(
+    '/echo.v1.Echo/Ping',
+    (request) => utf8.encode(jsonEncode(request)),
+    (payload) => jsonDecode(utf8.decode(payload)) as Map<String, dynamic>,
+  );
+
+  final call = channel.createCall(
+    method,
+    Stream<Map<String, dynamic>>.value(<String, dynamic>{
+      'message': message,
+    }),
+    CallOptions(timeout: const Duration(seconds: 5)),
+  );
+
+  return call.response.single;
+}
+
 String _resolveGoBinary() {
   final fromEnv = (Platform.environment['GO_BIN'] ?? '').trim();
   if (fromEnv.isNotEmpty) {
@@ -338,4 +436,11 @@ Map<String, String> _withGoCache() {
 
 String _shellQuote(String value) {
   return "'${value.replaceAll("'", "'\"'\"'")}'";
+}
+
+String _titleCase(String value) {
+  if (value.isEmpty) {
+    return value;
+  }
+  return value[0].toUpperCase() + value.substring(1).toLowerCase();
 }

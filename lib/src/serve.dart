@@ -149,11 +149,41 @@ Future<RunningServer> startWithOptions(
       options.onListen?.call('stdio://');
       options.logger('gRPC server listening on stdio:// ($mode)');
       return running;
+    case 'unix':
+      final path = parsed.path ?? '';
+      final backing = await _startTcpServer(
+        host: '127.0.0.1',
+        port: 0,
+        publicUri: null,
+        services: resolvedServices,
+        describeEnabled: describeEnabled,
+        options: options,
+        suppressAnnouncement: true,
+      );
+      final port = int.parse(backing.publicUri.split(':').last);
+      final bridge = await _UnixServerBridge.bind(
+        path: path,
+        host: '127.0.0.1',
+        port: port,
+      );
+      final publicUri = 'unix://$path';
+      final mode = describeEnabled ? 'Describe ON' : 'Describe OFF';
+      options.onListen?.call(publicUri);
+      options.logger('gRPC server listening on $publicUri ($mode)');
+      return RunningServer._(
+        server: backing.server,
+        publicUri: publicUri,
+        completion: backing.completion,
+        stopCallback: () async {
+          await bridge.close();
+          await backing.stop();
+        },
+      );
     default:
       throw ArgumentError.value(
         listenUri,
         'listenUri',
-        'Serve.run(...) currently supports tcp:// and stdio:// only',
+        'Serve.run(...) currently supports tcp://, unix://, and stdio:// only',
       );
   }
 }
@@ -315,5 +345,159 @@ class _StdioServerBridge {
     if (_pendingPumps == 0) {
       _onDisconnect();
     }
+  }
+}
+
+class _UnixServerBridge {
+  _UnixServerBridge._({
+    required ServerSocket listener,
+    required String path,
+    required String targetHost,
+    required int targetPort,
+  })  : _listener = listener,
+        _path = path,
+        _targetHost = targetHost,
+        _targetPort = targetPort;
+
+  final ServerSocket _listener;
+  final String _path;
+  final String _targetHost;
+  final int _targetPort;
+  final Set<Socket> _activeSockets = <Socket>{};
+  StreamSubscription<Socket>? _acceptSub;
+  bool _closed = false;
+
+  static Future<_UnixServerBridge> bind({
+    required String path,
+    required String host,
+    required int port,
+  }) async {
+    final socketFile = File(path);
+    if (socketFile.existsSync()) {
+      try {
+        socketFile.deleteSync();
+      } catch (_) {}
+    }
+
+    final listener = await ServerSocket.bind(
+      InternetAddress(path, type: InternetAddressType.unix),
+      0,
+    );
+    final bridge = _UnixServerBridge._(
+      listener: listener,
+      path: path,
+      targetHost: host,
+      targetPort: port,
+    );
+    bridge.start();
+    return bridge;
+  }
+
+  void start() {
+    _acceptSub = _listener.listen(
+      (client) async {
+        if (_closed) {
+          client.destroy();
+          return;
+        }
+
+        Socket? upstream;
+        try {
+          upstream = await Socket.connect(_targetHost, _targetPort);
+          _track(client);
+          _track(upstream);
+          _pipePair(client, upstream);
+        } catch (_) {
+          client.destroy();
+          upstream?.destroy();
+        }
+      },
+      onError: (_) {},
+      cancelOnError: false,
+    );
+  }
+
+  Future<void> close() async {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    await _acceptSub?.cancel();
+    try {
+      await _listener.close();
+    } catch (_) {}
+    for (final socket in _activeSockets.toList()) {
+      socket.destroy();
+    }
+    _activeSockets.clear();
+    final socketFile = File(_path);
+    if (socketFile.existsSync()) {
+      try {
+        socketFile.deleteSync();
+      } catch (_) {}
+    }
+  }
+
+  void _pipePair(Socket client, Socket upstream) {
+    StreamSubscription<List<int>>? clientSub;
+    StreamSubscription<List<int>>? upstreamSub;
+    var shuttingDown = false;
+
+    Future<void> shutdownPair() async {
+      if (shuttingDown) {
+        return;
+      }
+      shuttingDown = true;
+      await clientSub?.cancel();
+      await upstreamSub?.cancel();
+      _untrack(client);
+      _untrack(upstream);
+      client.destroy();
+      upstream.destroy();
+    }
+
+    clientSub = client.listen(
+      (data) {
+        if (_closed) {
+          return;
+        }
+        try {
+          upstream.add(data);
+        } catch (_) {
+          unawaited(shutdownPair());
+        }
+      },
+      onError: (_) => unawaited(shutdownPair()),
+      onDone: () => unawaited(shutdownPair()),
+      cancelOnError: true,
+    );
+
+    upstreamSub = upstream.listen(
+      (data) {
+        if (_closed) {
+          return;
+        }
+        try {
+          client.add(data);
+        } catch (_) {
+          unawaited(shutdownPair());
+        }
+      },
+      onError: (_) => unawaited(shutdownPair()),
+      onDone: () => unawaited(shutdownPair()),
+      cancelOnError: true,
+    );
+  }
+
+  void _track(Socket socket) {
+    if (_closed) {
+      socket.destroy();
+      return;
+    }
+    _activeSockets.add(socket);
+  }
+
+  void _untrack(Socket socket) {
+    _activeSockets.remove(socket);
   }
 }

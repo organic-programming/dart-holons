@@ -88,6 +88,49 @@ void main() {
   test('ConnectOptions defaults transport to stdio', () {
     expect(const ConnectOptions().transport, equals('stdio'));
   });
+
+  test(
+    'connect(slug) fails fast when a stdio child exits during startup',
+    () async {
+      final sandbox =
+          Directory.systemTemp.createTempSync('dart-holons-connect-fail');
+      addTearDown(() => sandbox.delete(recursive: true));
+
+      final fixture = _writeFailingHolonFixture(sandbox);
+      final previous = Directory.current;
+      Directory.current = sandbox;
+
+      try {
+        await expectLater(
+          connect(fixture.slug),
+          throwsA(
+            isA<StateError>()
+                .having(
+                  (error) => error.message,
+                  'message',
+                  contains('holon exited before accepting stdio RPCs'),
+                )
+                .having(
+                  (error) => error.message,
+                  'message',
+                  contains('stdio fixture refused startup'),
+                ),
+          ),
+        );
+      } finally {
+        Directory.current = previous;
+      }
+
+      expect(
+        await _waitForFileContents(fixture.argsFile),
+        equals('serve --listen stdio://'),
+      );
+    },
+    timeout: const Timeout(Duration(seconds: 10)),
+    skip: Platform.isWindows
+        ? 'connect stdio fixture uses a POSIX shell wrapper'
+        : false,
+  );
 }
 
 class _ConnectFixture {
@@ -135,6 +178,48 @@ build:
   runner: go-module
 artifacts:
   binary: "echo-server-wrapper"
+''');
+
+  return _ConnectFixture(
+    slug: slug,
+    pidFile: pidFile,
+    argsFile: argsFile,
+    portFile: '${sandbox.path}/.op/run/$slug.port',
+  );
+}
+
+_ConnectFixture _writeFailingHolonFixture(Directory sandbox) {
+  const slug = 'connect-stdio-fail';
+  final holonDir = Directory('${sandbox.path}/holons/$slug')
+    ..createSync(recursive: true);
+  final binDir = Directory('${holonDir.path}/.op/build/bin')
+    ..createSync(recursive: true);
+
+  final pidFile = '${sandbox.path}/$slug.pid';
+  final argsFile = '${sandbox.path}/$slug.args';
+  final wrapper = File('${binDir.path}/stdio-fail-wrapper');
+  wrapper.writeAsStringSync('''
+#!/bin/sh
+printf '%s\\n' "\$\$" > ${_shellQuote(pidFile)}
+printf '%s\\n' "\$*" > ${_shellQuote(argsFile)}
+printf '%s\\n' "stdio fixture refused startup" >&2
+exit 41
+''');
+  wrapper.setLastModifiedSync(DateTime.now());
+  Process.runSync('chmod', <String>['755', wrapper.path]);
+
+  File('${holonDir.path}/holon.yaml').writeAsStringSync('''
+schema: holon/v0
+uuid: "connect-stdio-fail-0000-0000-0000-000000001"
+given_name: "Connect"
+family_name: "Stdio-Fail"
+motto: "Fails fast."
+composer: "dart-holons-tests"
+kind: native
+build:
+  runner: go-module
+artifacts:
+  binary: "stdio-fail-wrapper"
 ''');
 
   return _ConnectFixture(

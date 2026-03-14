@@ -37,6 +37,7 @@ const ChannelOptions _stdioChannelOptions = ChannelOptions(
   credentials: ChannelCredentials.insecure(),
   idleTimeout: null,
 );
+const Duration _stdioStartupProbeWindow = Duration(milliseconds: 250);
 
 class _StdioClientChannel extends ClientChannel {
   final StdioTransportConnector _connector;
@@ -195,7 +196,29 @@ Future<(ClientChannel, Process)> _startStdioHolon(String binaryPath) async {
     binaryPath,
     const <String>['serve', '--listen', 'stdio://'],
   );
-  unawaited(process.stderr.drain<void>());
+  final recentLines = <String>[];
+  utf8.decoder
+      .bind(process.stderr)
+      .transform(const LineSplitter())
+      .listen((line) {
+    if (recentLines.length == 8) {
+      recentLines.removeAt(0);
+    }
+    recentLines.add(line);
+  });
+
+  final sentinel = Object();
+  final startup = await Future.any<Object?>(<Future<Object?>>[
+    process.exitCode
+        .then<Object?>((code) => (code, _recentLineDetails(recentLines))),
+    Future<Object?>.delayed(_stdioStartupProbeWindow, () => sentinel),
+  ]);
+  if (startup != sentinel) {
+    final failure = startup as (int, String);
+    throw StateError(
+      'holon exited before accepting stdio RPCs (${failure.$1})${failure.$2}',
+    );
+  }
 
   final connector = StdioTransportConnector.fromProcess(process);
   final channel = _StdioClientChannel(connector);
@@ -304,6 +327,13 @@ Future<void> _stopProcess(Process process) async {
       return process.exitCode;
     },
   );
+}
+
+String _recentLineDetails(List<String> recentLines) {
+  if (recentLines.isEmpty) {
+    return '';
+  }
+  return ': ${recentLines.join(' | ')}';
 }
 
 bool _isDirectTarget(String target) =>
